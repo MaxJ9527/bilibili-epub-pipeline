@@ -31,6 +31,7 @@ def esc(s):
     return html.escape(s, quote=False)
 
 def md_inline(s):
+    s = wiki_to_text(s)  # 统一在此转换（段落/引用/列表/表格单元全覆盖）
     # <small> 白名单（图注来源行）
     s = s.replace("<small>", "\x01").replace("</small>", "\x02")
     s = esc(s)
@@ -141,6 +142,11 @@ def parse_md(path):
             out.append(("h2", s[3:].strip()))
             i += 1
             continue
+        m3 = re.match(r"^(#{3,6})\s+(.+)$", s)
+        if m3:                             # 三级以下标题（老笔记有 ###）
+            out.append(("h3", m3.group(2).strip()))
+            i += 1
+            continue
         if not s:
             i += 1
             continue
@@ -189,6 +195,18 @@ def parse_md(path):
             continue
         out.append(("p", wiki_to_text(s)))
         i += 1
+    # 过滤「跨库延伸」：标记行 + 紧随的列表（站内导航性质，书里不要）
+    cleaned = []
+    skip_ku = False
+    for k, p in out:
+        if k == "p" and p.strip() == "**跨库延伸**":
+            skip_ku = True
+            continue
+        if skip_ku and k == "ul":
+            continue
+        skip_ku = False
+        cleaned.append((k, p))
+    out = cleaned
     # frontmatter 封面若正文没有嵌入，补到章首
     if cover and cover not in [p for k, p in out if k == "img"]:
         out.insert(0, ("img", cover))
@@ -237,10 +255,19 @@ class ImageStore:
 def block_html(kind, payload, istore):
     if kind == "h2":
         return f"<h2>{esc(payload)}</h2>"
+    if kind == "h3":
+        return f"<h3>{esc(payload)}</h3>"
     if kind == "p":
         return f"<p>{md_inline(payload)}</p>"
     if kind == "quote":
-        body = "".join(f"<p>{md_inline(q)}</p>" if q else "" for q in payload)
+        body = ""
+        for q in payload:
+            if not q:
+                continue
+            if q.startswith("- "):  # 引用块内的列表项（参考资料节常见写法）
+                body += f"<p>· {md_inline(q[2:])}</p>"
+            else:
+                body += f"<p>{md_inline(q)}</p>"
         return f"<blockquote>{body}</blockquote>"
     if kind == "ul":
         lis = "".join(f"<li>{md_inline(x)}</li>" for x in payload)
@@ -297,15 +324,26 @@ def title_page_xhtml(book_title, subtitle, groups):
 
 CSS = """body{font-family:"Songti SC","Noto Serif CJK SC",serif;line-height:1.7;margin:1em}
 h1{font-size:1.5em;margin:0 0 .8em}h2{font-size:1.2em;margin:1.2em 0 .5em;border-bottom:1px solid #999;padding-bottom:.2em}
+h3{font-size:1.05em;margin:1em 0 .4em;color:#333}
 p{margin:.6em 0;text-indent:0}blockquote{margin:.8em 1em;padding:.4em .8em;border-left:3px solid #999;color:#444}
 blockquote p{margin:.3em 0;font-size:.92em}
 table{border-collapse:collapse;margin:.8em 0;font-size:.9em}td{border:1px solid #aaa;padding:.2em .5em}
 ul{margin:.5em 1em}a{color:inherit}
 .img{margin:.8em 0;text-align:center}.img img{max-width:100%;height:auto}
 .titlepage{text-align:center;margin-top:20%}.titlepage h1{font-size:1.8em}.titlepage .sub{color:#666}
+.coverpage{margin:0;padding:0}.coverbox{text-align:center;margin:0}.coverbox img{max-width:100%;height:auto}
 """
 
-def build_epub(out_path, book_title, subtitle, groups):
+def cover_xhtml():
+    return """<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="zh-CN" lang="zh-CN">
+<head><meta charset="utf-8"/><title>封面</title><link rel="stylesheet" type="text/css" href="style.css"/></head>
+<body class="coverpage"><div class="coverbox"><img src="images/cover.jpg" alt="封面"/></div></body>
+</html>
+"""
+
+def build_epub(out_path, book_title, subtitle, groups, cover_path=None):
     uid = str(uuid.uuid4())
     istore = ImageStore()
     if os.path.exists(out_path):
@@ -319,6 +357,12 @@ def build_epub(out_path, book_title, subtitle, groups):
     zf.writestr("OEBPS/style.css", CSS)
 
     manifest, spine, nav_lis, ncx_pts = [], [], [], []
+    if cover_path and os.path.exists(cover_path):
+        zf.writestr("OEBPS/images/cover.jpg", open(cover_path, "rb").read())
+        manifest.append('<item id="cover-image" href="images/cover.jpg" media-type="image/jpeg" properties="cover-image"/>')
+        zf.writestr("OEBPS/cover.xhtml", cover_xhtml())
+        manifest.append('<item id="coverpage" href="cover.xhtml" media-type="application/xhtml+xml"/>')
+        spine.append('<itemref idref="coverpage"/>')
     play = 1
     zf.writestr("OEBPS/title.xhtml", title_page_xhtml(book_title, subtitle, groups))
     manifest.append('<item id="title" href="title.xhtml" media-type="application/xhtml+xml"/>')
@@ -404,6 +448,8 @@ def main():
     ap.add_argument("--out-dir", default=".", help="EPUB 输出目录")
     ap.add_argument("--maxw", type=int, default=1024, help="图片限宽像素")
     ap.add_argument("--quality", type=int, default=72, help="JPEG 质量")
+    ap.add_argument("--cover1", help="书一封面图路径")
+    ap.add_argument("--cover2", help="书二封面图路径")
     args = ap.parse_args()
     VAULT = args.vault
     ASSETS = args.assets or os.path.dirname(os.path.dirname(VAULT))
@@ -445,9 +491,9 @@ def main():
     out1 = os.path.join(args.out_dir, "小约翰可汗·硬核狠人与单集.epub")
     out2 = os.path.join(args.out_dir, "小约翰可汗·奇葩小国与神奇组织.epub")
     n1, st1 = build_epub(out1, "小约翰可汗 · 硬核狠人与单集",
-                         "硬核狠人系列（按编号）+ 单集（按发布时间）", groups1)
+                         "硬核狠人系列（按编号）+ 单集（按发布时间）", groups1, args.cover1)
     n2, st2 = build_epub(out2, "小约翰可汗 · 奇葩小国与神奇组织",
-                         "奇葩小国系列 + 神奇组织系列（均按编号）", groups2)
+                         "奇葩小国系列 + 神奇组织系列（均按编号）", groups2, args.cover2)
     print(f"书一 {out1}: {n1} 章, {st1.n} 图, 失败 {len(st1.fail)}")
     print(f"书二 {out2}: {n2} 章, {st2.n} 图, 失败 {len(st2.fail)}")
     for f in (st1.fail + st2.fail)[:10]:
